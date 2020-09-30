@@ -209,7 +209,17 @@ sub write_output {
               {
                  species => $species,
                  group   => $group,
-                 current_step => $each_step
+                 current_step => $each_step,
+                 dbname     => $self->param('dbname'),
+                 gca        => $self->param('gca'),
+                 assembly_default => $self->param('assembly_default'),
+                 assembly_ucsc => $self->param('assembly_ucsc'),
+                 level      => $self->param('level'),
+                 genome_id  => $self->param('genome_id'),
+                 version    => $self->param('version'),
+                 type       => $self->param('division'),
+                 root_path  => $self->param('root_path'),
+    
               }, $each_flow{$each_step}
             );
         }  

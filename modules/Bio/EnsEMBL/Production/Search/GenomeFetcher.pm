@@ -104,8 +104,7 @@ sub fetch_metadata {
 	$logger->debug("Fetching metadata for genome $name");
 	croak "No metadata DB adaptor found" unless defined $self->{info_adaptor};
 	my $orgs = $self->{info_adaptor}->fetch_by_name($name);
-	my $meta = Bio::EnsEMBL::Registry->get_adaptor( $name, 'core',
-															'MetaContainer' );
+	my $meta = Bio::EnsEMBL::Registry->get_adaptor( $name, 'core', 'MetaContainer' );
 	if ( !defined $meta ) {
 		croak "Cannot find genome $name";
 	}

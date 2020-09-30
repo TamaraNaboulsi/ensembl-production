@@ -116,14 +116,14 @@ sub pipeline_analyses {
                            }, 
             -flow_into        => {
                       '1' =>  ['StepGeneAndTranscript'],
-                      '2' =>  ['StepContigs'],
-                      '3' =>  ['StepGC'],
-                      '4' =>  ['StepVariation'],
+                      #'2' =>  ['StepContigs'],
+                      #'3' =>  ['StepGC'],
+                      #'4' =>  ['StepVariation'],
             },
 
         },
         {   -logic_name => 'StepGeneAndTranscript',
-              -module     => 'Bio::EnsEMBL::Production::Pipeline::Webdatafile::WebdataFile',
+              -module     => 'Bio::EnsEMBL::Production::Pipeline::Webdatafile::WebdataFileGeneAndTranscript',
         },
         {   -logic_name => 'StepContigs',
               -module     => 'Bio::EnsEMBL::Production::Pipeline::Webdatafile::WebdataFile',
