@@ -36,7 +36,13 @@ use Array::Utils qw(intersect);
 use Path::Tiny qw(path);
 use Carp qw/croak/;
 use JSON qw/decode_json/;
+require  Bio::EnsEMBL::Feature;
 use Bio::EnsEMBL::Production::Pipeline::Webdatafile::lib::GenomeLookup;
+use MIME::Base64 qw/encode_base64/;
+use Encode qw/encode/;
+use List::MoreUtils qw(uniq);
+use CoordinateConverter qw(to_zero_based);
+
 sub param_defaults {
   my ($self) = @_;
   return {
@@ -68,21 +74,19 @@ sub run {
   my $genome = $lookup->get_genome('1');
   my $genome_report = $genome->get_genome_report();
   my @chrs = sort {$a cmp $b } map { $_->name() } grep { $_->is_assembled } @{$genome_report};
-  my $transcripts_fh = $genome->genes_transcripts_path()->child('transcripts.bed')->openw;
-  my $canonicals = $self->get_canonicals($genome, $dba);
-  my $mane_selects = $self->get_mane_selects($genome, $dba);
+  $self->{transcripts_fh} = $genome->genes_transcripts_path()->child('transcripts.bed')->openw;
+  $self->{canonicals} = $self->get_canonicals($genome, $dba);
+  $self->{mane_selects} = $self->get_mane_selects($genome, $dba);
+ 
   # In-memory storage for genes, transcripts and exons during processing of a single chromosome
-  my $gene_record = {};
-  my $transcript_record = {};
-  my $exon_record = {};
+  $self->{gene_record} = {};
+  $self->{transcript_record} = {};
+  $self->{exon_record} = {};
   
   while(my $chr = shift @chrs) {
      $self->process_chromosome($chr, $slice_adaptor, $genome);
   }
-
-  close $transcripts_fh;
-  
-
+  close $self->{transcripts_fh};
 }
 
 sub process_chromosome {
@@ -102,88 +106,173 @@ sub process_chromosome {
       $finished = 1;
     }
 
-    #process_region($chr, $start, $new_end);
     my $data = $self->get_overlaps($chr, $start, $end, $slice_adaptor);
-    #update_temporary_storage($data);
+    $self->update_temporary_storage($data);
     $start = $new_end+1;
+    #$self->write_transcripts($chr,$self->{transcripts_fh});
+  }
+  $self->write_transcripts($chr,$self->{transcripts_fh});
+  $self->clear_temporary_storage();
+}
+
+sub clear_temporary_storage {
+  my $self = shift;
+  $self->{gene_record} = {};
+  $self->{transcript_record} = {};
+  $self->{exon_record} = {};
+}
+
+sub update_temporary_storage {
+  my ($self, $features) = @_;
+  my @exons = grep { $_->{feature_type} eq 'exon' } @$features;
+  my @cdss = grep { $_->{feature_type} eq 'cds' } @$features;
+  
+  foreach my $feature (@{$features}) {
+    my $feature_id = $feature->{id};
+    if ($feature->{feature_type} eq 'gene' && !defined($self->{gene_record}->{$feature_id})) {
+       $self->{gene_record}->{$feature_id} = $feature;
+    } elsif ($feature->{feature_type} eq 'transcript' && !defined($self->{transcript_record}->{$feature_id})) {
+       $feature->{exon_ids} = [];
+      # add default positions for CDS, which will be used if the transcript is non-coding
+       $feature->{cds_start} = $feature->{start};
+       $feature->{cds_end} = $feature->{start};
+       $self->add_transcript_designation($feature);
+       $self->{transcript_record}->{$feature_id} = $feature;
+    } elsif ($feature->{feature_type} eq 'exon' && !defined($self->{exon_record}->{$feature_id})) {
+          $self->{exon_record}->{$feature_id} = $feature;
+    }
+
   }
 
- 
+  foreach my $exon (@exons) {
+    my $transcript_id = $exon->{Parent};
+    my $transcript = $self->{transcript_record}->{$transcript_id};
+    my $transcript_exons = $transcript->{exon_ids};
+    push @$transcript_exons, $exon->{id};
+    $transcript_exons = [uniq(@$transcript_exons)];
+    $transcript->{exons} = $transcript_exons;
+    $self->{transcript_record}->{$transcript_id} = $transcript;
+  }
+
+  foreach my $cds (@cdss) {
+    my $transcript_id = $cds->{Parent};
+    my $transcript = $self->{transcript_record}->{$transcript_id};
+    if ($transcript->{cds_start} == $transcript->{cds_end}) {
+      $transcript->{cds_start} = $cds->{start};
+      $transcript->{cds_end} = $cds->{end};
+    } elsif ($cds->{start} < $transcript->{cds_start}) {
+      $transcript->{cds_start} = $cds->{start};
+    } elsif ($cds->{end} > $transcript->{cds_end}) {
+      $transcript->{cds_end} = $cds->{end};
+    }
+  }
+
+
+}# update end
+
+
+sub add_transcript_designation {
+  my ($self, $transcript) = @_;
+  if($self->{mane_selects}->{$transcript->{id}}) {
+    $transcript->{designation} = 'mane_select';
+  } elsif ($self->{canonicals}->{$transcript->{id}}) {
+    $transcript->{designation} = 'canonical';
+  } else {
+    $transcript->{designation} = '-';
+  }
 }
 
 sub get_overlaps {
-  my ($self, $chr, $start, $end, $slice_adaptor) = @_;
+
+  #replaced rest api with perl api function "https://${rest}/overlap/region/${species}/${chr}:${start}-${end}?content-type=application/json;feature=gene;feature=transcript;feature=exon;feature=cds";
+  my ($self, $chr, $start, $end, $slice_adaptor) = @_; 
   my $slice = $slice_adaptor->fetch_by_region( $self->param('level'), $chr, $start, $end );
-  my @data = ();
-  my $genes = $slice->get_all_Genes();
-  my $transcripts = $slice->get_all_Transcripts();
-  my $exons = $slice->get_all_Exons();
-  for my $each_gene (@$genes){
 
-       push(@data, {
-        "gene_id" => $each_gene->stable_id(),
-        "source"  => $each_gene->source(),
-        "logic_name" =>  "",
-        "version"    => $each_gene->version(),
-        "feature_type" => "gene",
-        "external_name"  => $each_gene->external_name(),
-        "description"  => $each_gene->description(),
-        "assembly_name"  => $self->param('assembly_default'),
-        "biotype"   =>  $each_gene->biotype(),
-        "end"  =>  $each_gene->end(),
-        "seq_region_name" => $chr,
-        "strand"  => $each_gene->strand(),
-        "id"  => $each_gene->stable_id(),
-        "start"  => $each_gene->start()
+  my @final_features;
+  my @features = ('gene', 'transcript', 'cds', 'exon');
+  # record when we've processed a feature type already
+  my %processed_feature_types;
 
-       });
-
-  }
- 
-  for my $each_transcript (@$transcripts){
-    $self->warning("------------");
-    for my $key (keys %$each_transcript){
-        $self->warning($key);
-        $self->warning($each_transcript->{$key}());
-    }
-    $self->warning("ens....") ;
-    exit;
-=head
-       push(@data, {
-          "source": $each_transcript->source(),
-          "logic_name": "",
-          "feature_type": "transcript",
-          "external_name": $each_transcript->external_name(),
-          "Parent": "ENSG00000146955",
-          "transcript_support_level": "2",
-          "seq_region_name": "7",
-          "strand": 1,
-          "id": "ENST00000495590",
-          "transcript_id": "ENST00000495590",
-          "version": 5,
-          "assembly_name": "GRCh38",
-          "description": null,
-          "end": 140425943,
-         "biotype": "protein_coding",
-         "start": 140404043
-       });
-=cut
+  foreach my $feature_type (@features) {
+    next if exists $processed_feature_types{$feature_type};
+    next if $feature_type eq 'none';
+    my $objects = $self->$feature_type($slice);
+    push(@final_features, @{$self->to_hash($objects, $feature_type)});
+    $processed_feature_types{$feature_type} = 1;   
   }
 
+  return \@final_features;
 
-
-  #my @transcripts = @{$slice->get_all_()};
-   
-
-  
-
-
-  exit;
-  #my $url = "https://${rest}/overlap/region/${species}/${chr}:${start}-${end}?content-type=application/json;feature=gene;feature=transcript;feature=exon;feature=cds";
 }
 
+sub gene {
+  my ($self, $slice) = @_;
+  return $slice->get_all_Genes();
+}
 
+sub transcript {
+  my ($self, $slice, $load_exons) = @_;
+  
+  my $transcripts = $slice->get_all_Transcripts();
+  return $transcripts;
+}
 
+sub cds {
+  my ($self, $slice, $load_exons) = @_;
+  my $transcripts = $self->transcript($slice, 0);
+  my @cds;
+  foreach my $transcript (@$transcripts) {
+    push (@cds, @{ $transcript->get_all_CDS });
+  }
+  return \@cds;
+}
+
+sub exon {
+  my ($self, $slice) = @_;
+  my $transcripts = $self->transcript($slice, 0);
+  my @exons;
+  foreach my $transcript (@$transcripts) {
+    foreach my $exon (@{ $transcript->get_all_ExonTranscripts}) {
+      if (($slice->start < $exon->seq_region_start && $exon->seq_region_start < $slice->end) || ($slice->start < $exon->seq_region_end && $exon->seq_region_end < $slice->end) ||($slice->start >= $exon->seq_region_start && $slice->end <= $exon->seq_region_end) ) {
+        push (@exons, $exon);
+      }
+    }
+  }
+  return \@exons;
+}
+
+sub to_hash {
+  my ($self, $features, $feature_type) = @_;
+  my @hashed;
+  my @KNOWN_NUMERICS = qw( start end strand version );
+  foreach my $feature (@{$features}) {
+    my $hash = $feature->summary_as_hash();
+    foreach my $key (@KNOWN_NUMERICS) {
+      my $v = $hash->{$key};
+      $hash->{$key} = ($v*1) if defined $v;
+    }
+    if ($hash->{Name}) {
+      $hash->{external_name} = $hash->{Name};
+      delete $hash->{Name};
+    }
+    $hash->{feature_type} = $feature_type;
+    push(@hashed, $hash);
+  }
+  return \@hashed;
+}
+
+sub Bio::EnsEMBL::Feature::summary_as_hash {
+  my $self = shift;
+  my %summary;
+  $summary{'id'} = $self->display_id;
+  $summary{'version'} = $self->version() if $self->version();
+  $summary{'start'} = $self->seq_region_start;
+  $summary{'end'} = $self->seq_region_end;
+  $summary{'strand'} = $self->strand;
+  $summary{'seq_region_name'} = $self->seq_region_name;
+  $summary{'assembly_name'} = $self->slice->coord_system->version() if $self->slice();
+  return \%summary;
+}
 
 sub get_canonicals {
 
@@ -211,21 +300,106 @@ sub get_mane_selects {
   foreach my $row (@$result) {
     $mane_hash->{$row->[0]} = $row->[1];
   }
-
+  return $mane_hash;
 }
 
 
+sub write_transcripts {
+  my ($self, $chr, $transcripts_fh) = @_;
+  foreach my $transcript_id (keys %{$self->{transcript_record}}) {
+    my $transcript_line = $self->prepare_transcript_line($chr, $transcript_id);
+    print $transcripts_fh "$transcript_line\n" or die "Cannot print to transcripts.bed";
+  }
+}
 
+sub prepare_transcript_line {
+
+  my ($self, $chr, $transcript_id) = @_;
+  my $transcript = $self->{transcript_record}->{$transcript_id};
+  my @exons =
+    sort { $a->{start} <=> $b->{start} }
+    map { $self->{exon_record}->{$_} } @{$transcript->{exons}};
+  my $gene = $self->{gene_record}->{$transcript->{Parent}};
+
+  if (!defined($gene)) {
+    $self->warning("gene...................not defined");
+  #  $gene = fetch_gene_directly($transcript->{Parent});
+  }
+
+  my $transcript_start = $transcript->{start};
+  my $transcript_end = $transcript->{end};
+  my $versioned_transcript_id = $self->get_versioned_feature_id($transcript);
+  my $strand = $transcript->{strand} > 0 ? '+' : '-';
+  my $cds_start = $transcript->{cds_start};
+  my $cds_end = $transcript->{cds_end};
+  my $exons_count = scalar @exons;
+  my @exon_lengths = map { $_->{end} - $_->{start} } @exons;
+  my $exon_lengths = join(',', @exon_lengths) . ',';
+  my @exon_starts = map { $_->{start} - $transcript_start } @exons;
+  my $exon_starts = join(',', @exon_starts) . ',';
+  my $versioned_gene_id = $self->get_versioned_feature_id($gene);
+  my $gene_name = $self->get_gene_name($gene);
+  my $gene_start = $gene->{start};
+  my $gene_end = $gene->{end};
+  my $gene_biotype = $gene->{biotype};
+  my $transcript_biotype = $transcript->{biotype};
+  my $transcript_designation = $transcript->{designation};
+  my $gene_description = $self->get_gene_description($gene);
+
+  my $line = join "\t", (
+    $chr,
+    to_zero_based($gene_start),
+    $gene_end, # end position is not adjusted for beds
+    $versioned_transcript_id,
+    $strand,
+    to_zero_based($cds_start),
+    $cds_end == $cds_start ? to_zero_based($cds_start) : $cds_end, # lack of coding sequence in a transcript is indicated by setting the end position as equal to start position (which is equal to transcript start)
+    $exons_count, # required during indexing with bedToBigBed (tells bedToBigBed how long exon_lengths and exon_starts arrays are)
+    $exon_lengths,
+    $exon_starts, # relative to transcript start position
+    to_zero_based($transcript_start),
+    $transcript_end, # end position is not adjusted for beds
+    $transcript_biotype,
+    $transcript_designation,
+    $versioned_gene_id,
+    $gene_name,
+    $gene_description,
+    $gene_biotype
+  );
+
+  return $line;
+
+
+} #prepare end
+
+sub get_gene_description {
+  my ($self, $gene) = @_;
+  my $description = $gene->{description} || '-';
+
+  if($description =~ /\s+\[.+\]$/) {
+    $description =~ s/\s+\[.+\]$//;
+  }
+  return encode_base64(encode('UTF-8', $description), q{});
+}
+
+sub get_versioned_feature_id {
+  my ($self, $feature) = @_;
+  return defined($feature->{version})
+    ? "$feature->{id}" . "$feature->{version}"
+    : $feature->{id};
+}
+
+
+sub get_gene_name {
+  my ($sel, $gene) = @_;
+  my $gene_name = $gene->{external_name} || $gene->{display_name} || $gene->{id};
+  $gene_name =~ s/\s+//g; # remove potential whitespace from gene name to avoid confusing bigbed parser
+  return $gene_name;
+}
 
 
 sub write_output {
-  my ($self) = @_;
-  my $species        = $self->param('species');
-  my $group          = $self->param('group');
-  my $current_step   = $self->param('current_step');
   
 }
-
-
 
 1;
