@@ -42,6 +42,7 @@ use MIME::Base64 qw/encode_base64/;
 use Encode qw/encode/;
 use List::MoreUtils qw(uniq);
 use CoordinateConverter qw(to_zero_based);
+use Bio::EnsEMBL::Production::Pipeline::Webdatafile::lib::IndexBed;
 
 sub param_defaults {
   my ($self) = @_;
@@ -82,16 +83,32 @@ sub run {
   $self->{gene_record} = {};
   $self->{transcript_record} = {};
   $self->{exon_record} = {};
-  
+
   while(my $chr = shift @chrs) {
+     $self->warning("Processing..................chr: $chr");
      $self->process_chromosome($chr, $slice_adaptor, $genome);
   }
+
   close $self->{transcripts_fh};
+
+  my $transcripts_bed = $genome->genes_transcripts_path()->child('transcripts.bed');
+  my $indexer = Bio::EnsEMBL::Production::Pipeline::Webdatafile::lib::IndexBed->transcript($genome);
+  $indexer->index($transcripts_bed);
+
 }
 
 sub process_chromosome {
   my ($self, $chr, $slice_adaptor, $genome) = @_;
-  
+  my $data = $self->get_overlaps($chr, $slice_adaptor);
+  $self->update_temporary_storage($data);
+  $self->write_transcripts($chr, $self->{transcripts_fh}, $slice_adaptor);
+  $self->clear_temporary_storage();
+}
+
+
+sub process_chromosome_by_chunck {
+
+  my ($self, $chr, $slice_adaptor, $genome) = @_;
   my $slice = $slice_adaptor->fetch_by_region( $self->param('level'), $chr );
   my $start = 1;
   my $end = $slice->length; #replaced get_length function which was using restapi
@@ -109,11 +126,11 @@ sub process_chromosome {
     my $data = $self->get_overlaps($chr, $start, $end, $slice_adaptor);
     $self->update_temporary_storage($data);
     $start = $new_end+1;
-    #$self->write_transcripts($chr,$self->{transcripts_fh});
+    $self->write_transcripts($chr,$self->{transcripts_fh});
   }
-  $self->write_transcripts($chr,$self->{transcripts_fh});
-  $self->clear_temporary_storage();
+
 }
+
 
 sub clear_temporary_storage {
   my $self = shift;
@@ -185,8 +202,10 @@ sub add_transcript_designation {
 sub get_overlaps {
 
   #replaced rest api with perl api function "https://${rest}/overlap/region/${species}/${chr}:${start}-${end}?content-type=application/json;feature=gene;feature=transcript;feature=exon;feature=cds";
-  my ($self, $chr, $start, $end, $slice_adaptor) = @_; 
-  my $slice = $slice_adaptor->fetch_by_region( $self->param('level'), $chr, $start, $end );
+  #my ($self, $chr, $start, $end, $slice_adaptor) = @_; 
+  my ($self, $chr, $slice_adaptor) = @_; 
+  #my $slice = $slice_adaptor->fetch_by_region( $self->param('level'), $chr, $start, $end );
+  my $slice = $slice_adaptor->fetch_by_region( $self->param('level'), $chr );
 
   my @final_features;
   my @features = ('gene', 'transcript', 'cds', 'exon');
@@ -305,16 +324,16 @@ sub get_mane_selects {
 
 
 sub write_transcripts {
-  my ($self, $chr, $transcripts_fh) = @_;
+  my ($self, $chr, $transcripts_fh, $slice_adaptor) = @_;
   foreach my $transcript_id (keys %{$self->{transcript_record}}) {
-    my $transcript_line = $self->prepare_transcript_line($chr, $transcript_id);
+    my $transcript_line = $self->prepare_transcript_line($chr, $transcript_id, $slice_adaptor);
     print $transcripts_fh "$transcript_line\n" or die "Cannot print to transcripts.bed";
   }
 }
 
 sub prepare_transcript_line {
 
-  my ($self, $chr, $transcript_id) = @_;
+  my ($self, $chr, $transcript_id, $slice_adaptor) = @_;
   my $transcript = $self->{transcript_record}->{$transcript_id};
   my @exons =
     sort { $a->{start} <=> $b->{start} }
@@ -322,8 +341,15 @@ sub prepare_transcript_line {
   my $gene = $self->{gene_record}->{$transcript->{Parent}};
 
   if (!defined($gene)) {
-    $self->warning("gene...................not defined");
-  #  $gene = fetch_gene_directly($transcript->{Parent});
+     my $slice = $slice_adaptor->fetch_by_gene_stable_id( $transcript->{Parent} ); 
+     my @gene_array = grep { $_->stable_id() eq $transcript->{Parent} } @{ $slice->get_all_Genes() };
+
+     @gene_array =  @{$self->to_hash(\@gene_array, 'gene')};   
+     if (scalar @gene_array){
+        $gene = $gene_array[0]; 
+     } else{
+       $self->warning('gene not found......');
+     }
   }
 
   my $transcript_start = $transcript->{start};
