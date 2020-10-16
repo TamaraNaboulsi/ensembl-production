@@ -70,6 +70,7 @@ sub build_seq {
   my $accession = $self->accession();
   my $url_format = $self->url_format();
   my $url = sprintf($url_format, $accession);
+   
   my $resp = HTTP::Tiny->new()->get($url);
   if(!$resp->{success}) {
     confess "Failed to download ${accession}. $resp->{reason}";

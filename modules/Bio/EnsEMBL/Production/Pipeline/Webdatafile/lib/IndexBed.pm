@@ -5,7 +5,7 @@ use Path::Tiny;
 
 with 'UcscIndex';
 
-has 'genome'    => ( is => 'any', is => 'ro', required => 1 );
+has 'genome'    => ( is => 'Any', is => 'ro', required => 1 );
 has 'bed_type'  => ( isa => 'Str', is => 'ro', required => 0 );
 has 'auto_sql'  => ( isa => 'Path::Tiny', is => 'ro', required => 0 );
 has 'indexes'   => ( isa => 'Str', is => 'ro', required => 0 );
