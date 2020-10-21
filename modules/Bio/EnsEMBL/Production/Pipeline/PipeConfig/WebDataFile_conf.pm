@@ -58,7 +58,9 @@ sub pipeline_wide_parameters {
     return { %{$self->SUPER::pipeline_wide_parameters()},
         output_path       => $self->o('output_path'),
         app_path          => $self->o('app_path'),
-        genomeinfo_yml    => $self->o('genomeinfo_yml')
+        genomeinfo_yml    => $self->o('genomeinfo_yml'),
+        ENS_VERSION       => $self->o('ENS_VERSION'),  
+        EG_VERSION        => $self->o('EG_VERSION')
     };
 }
 
@@ -112,27 +114,30 @@ sub pipeline_analyses {
             #-module     => 'Bio::EnsEMBL::Production::Pipeline::Webdatafile::WebdataFile',
             -module     => 'Bio::EnsEMBL::Production::Pipeline::Webdatafile::WebdataFileBootstrap',
             -parameters => { current_step       => 'bootstrap',
-                             step => $self->o('step',)
+                             step => $self->o('step')
                            }, 
             -flow_into        => {
                       '1' =>  ['StepGeneAndTranscript'],
-                      #'2' =>  ['StepContigs'],
-                      #'3' =>  ['StepGC'],
-                      #'4' =>  ['StepVariation'],
+                      '2' =>  ['StepContigs'],
+                      '3' =>  ['StepGC'],
+                      '4' =>  ['StepVariation'],
             },
 
         },
         {   -logic_name => 'StepGeneAndTranscript',
               -module     => 'Bio::EnsEMBL::Production::Pipeline::Webdatafile::WebdataFileGeneAndTranscript',
+             -rc_name    => 'large', 
         },
         {   -logic_name => 'StepContigs',
-              -module     => 'Bio::EnsEMBL::Production::Pipeline::Webdatafile::WebdataFile',
+              -module     => 'Bio::EnsEMBL::Production::Pipeline::Webdatafile::WebdataFileContigs',
         },
         {   -logic_name => 'StepGC',
-            -module     => 'Bio::EnsEMBL::Production::Pipeline::Webdatafile::WebdataFile',
+            -module     => 'Bio::EnsEMBL::Production::Pipeline::Webdatafile::WebdataFileGenerateGC',
+             -rc_name    => 'mem',
 	},
         {   -logic_name => 'StepVariation',
-            -module     => 'Bio::EnsEMBL::Production::Pipeline::Webdatafile::WebdataFile',
+            -module     => 'Bio::EnsEMBL::Production::Pipeline::Webdatafile::WebdataFileVariation',
+            -rc_name     => 'large', 
         },
         {
            -logic_name => 'email_notification',
@@ -148,6 +153,18 @@ sub pipeline_analyses {
 
     ];
 } ## end sub pipeline_analyses
+
+sub resource_classes {
+  my ($self) = @_;
+
+  return {
+    %{$self->SUPER::resource_classes},
+    'small' => { 'LSF' => '-q production-rh74 -M 200 -R "rusage[mem=200]"'},
+    'mem'   => { 'LSF' => '-q production-rh74 -M 3000 -R "rusage[mem=3000]"'},
+    'large' => { 'LSF' => '-q production-rh74 -M 10000 -R "rusage[mem=10000]"'},
+  }
+}
+
 
 
 1;
