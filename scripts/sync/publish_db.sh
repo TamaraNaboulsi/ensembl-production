@@ -1,6 +1,6 @@
 #!/bin/sh
 # Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
-# Copyright [2016-2021] EMBL-European Bioinformatics Institute
+# Copyright [2016-2020] EMBL-European Bioinformatics Institute
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,9 +22,9 @@ fi
 sql='grant select, show view on `'$db'`.* to `anonymous`@`%`';
 echo "database: " $db
 echo "sql: " $sql
-admin-mysql-eg-publicsql -e "$sql"
+admin-mysql-eg-publicsql-hx -e "$sql"
 admin-mysql-eg-publicsql-hh -e "$sql"
 sql2='grant select, show view on `'$db'`.* to `ensro`@`%.ebi.ac.uk`';
 echo "sql: " $sql2
-admin-mysql-eg-publicsql -e "$sql2"
+admin-mysql-eg-publicsql-hx -e "$sql2"
 admin-mysql-eg-publicsql-hh -e "$sql2"
