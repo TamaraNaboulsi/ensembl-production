@@ -30,6 +30,7 @@ use Bio::EnsEMBL::Transcript;
 use Bio::EnsEMBL::CDS;
 use Bio::EnsEMBL::Utils::IO::GFFSerializer;
 use Path::Tiny;
+use Bio::EnsEMBL::MiscFeature;
 
 sub param_defaults {
   my ($self) = @_;
@@ -164,6 +165,7 @@ sub exon_features {
   my @cds_features;
   my @exon_features;
   my @utr_features;
+  my @codon_features;
 
   foreach my $transcript (@$transcripts) {
     push @cds_features, @{ $transcript->get_all_CDS(); };
@@ -172,9 +174,12 @@ sub exon_features {
       push @utr_features, @{ $transcript->get_all_five_prime_UTRs()};
       push @utr_features, @{ $transcript->get_all_three_prime_UTRs()};
     }
+
+    push @codon_features, get_start_stop_codon_features($transcript);
+    push @codon_features, make_seleno_features($transcript);
   }
 
-  return [@exon_features, @cds_features, @utr_features];
+  return [@exon_features, @cds_features, @utr_features, @codon_features];
 }
 
 sub tidy {
@@ -214,6 +219,263 @@ sub validate {
       "Output: $output";
     $self->throw($msg);
   }
+}
+
+sub get_start_stop_codon_features {
+  my ($transcript) = @_;
+
+  my @codon_features;
+
+  my @start_codons = make_start_codon_features($transcript);
+  my @stop_codons = make_stop_codon_features($transcript);
+
+  my $translation = $transcript->translation();
+  return (()) unless (defined($translation));
+
+  my ($has_start, $has_end) = check_start_and_stop($transcript);
+
+  foreach my $exon (@{$transcript->get_all_Exons}) {
+    if ($translation && $exon == $translation->start_Exon && $has_start) {
+      push(@codon_features, @start_codons);
+    }
+    if ($translation && $exon == $translation->end_Exon && $has_end) {
+      push(@codon_features, @stop_codons);
+    }
+  }
+
+  return @codon_features;
+}
+
+sub check_start_and_stop {
+  my ($transcript) = @_;
+
+  return (0, 0) unless (defined($transcript->translation));
+  my ($has_start, $has_end);
+
+  my @attrib = @{$transcript->get_all_Attributes('cds_start_NF')};
+  $has_start = (scalar(@attrib) == 1 && $attrib[0]->value() == 1) ? 0 : 1;
+  @attrib = @{$transcript->get_all_Attributes('cds_end_NF')};
+  $has_end = (scalar(@attrib) == 1 && $attrib[0]->value() == 1) ? 0 : 1;
+
+  return (0, 0) unless ($has_start || $has_end);
+
+  my $cds_seq = uc($transcript->translateable_seq);
+  my $start_seq = substr($cds_seq, 0, 3);
+
+  my @exons = @{$transcript->get_all_translateable_Exons};
+  my $last_exon = $exons[$#exons];
+  my $phase = $last_exon->end_phase;
+  $phase = 0 if ($phase == -1);
+  my $end_seq = substr($cds_seq, -(3-$phase));
+
+  my ($attrib) = @{$transcript->slice()->get_all_Attributes('codon_table')};
+  my $codon_table_id = $attrib->value() if (defined($attrib));
+  $codon_table_id ||= 1;
+  my $codon_table = Bio::Tools::CodonTable->new(-id => $codon_table_id);
+
+  $has_start = 0 unless ($codon_table->is_start_codon($start_seq));
+  $has_end = 0 unless ($codon_table->is_ter_codon($end_seq));
+
+  return ($has_start, $has_end);
+}
+
+sub make_start_codon_features {
+  my ($transcript) = @_;
+
+  return (()) if (!$transcript->translation);
+
+  my @pepgencoords = $transcript->pep2genomic(1,1);
+
+  return (()) if (scalar(@pepgencoords) > 2);
+  return (()) unless ($pepgencoords[0]->isa('Bio::EnsEMBL::Mapper::Coordinate'));
+  return (()) unless ($pepgencoords[$#pepgencoords]->isa('Bio::EnsEMBL::Mapper::Coordinate'));
+
+  my @translateable_exons = @{$transcript->get_all_translateable_Exons};
+  my @start_codon_features;
+
+  foreach my $pepgencoord (@pepgencoords) {
+    my $misc_feature = Bio::EnsEMBL::MiscFeature->new(
+      -seqname => $transcript->seq_region_name,
+      -start => $pepgencoord->start,
+      -end   => $pepgencoord->end,
+      -strand => $translateable_exons[0]->strand,
+    );
+    my $attributes = {
+      'so_term' => 'start_codon',
+      'parent_so_term' => 'transcript',
+      'version' => $transcript->version,
+      'parent' => $transcript->stable_id,
+      'source' => $transcript->source
+    };
+    while (my ($key, $value) = each %{$attributes}) {
+      my $attr = Bio::EnsEMBL::Attribute->new(
+        -CODE => $key,
+        -NAME => $key,
+        -VALUE => $value
+      );
+      $misc_feature->add_Attribute($attr);
+    }
+    push @start_codon_features, $misc_feature;
+  }
+
+  if ($translateable_exons[0]->strand == 1) {
+    @start_codon_features = sort {$a->start <=> $b->start } @start_codon_features;
+  } else {
+    @start_codon_features = sort {$b->start <=> $a->start } @start_codon_features;
+  }
+
+  return @start_codon_features;
+}
+
+sub make_stop_codon_features {
+  my ($transcript) = @_;
+
+  return (()) if (!$transcript->translation);
+
+  my $cdna_endpos = $transcript->cdna_coding_end;
+  my @pepgencoords = $transcript->cdna2genomic($cdna_endpos-2,$cdna_endpos);
+
+  return (()) if(scalar(@pepgencoords) > 2);
+  return (()) unless($pepgencoords[0]->isa('Bio::EnsEMBL::Mapper::Coordinate'));
+  return (()) unless($pepgencoords[$#pepgencoords]->isa('Bio::EnsEMBL::Mapper::Coordinate'));
+
+  my @translateable_exons = @{$transcript->get_all_translateable_Exons};
+  my @stop_codon_features;
+
+  foreach my $pepgencoord (@pepgencoords) {
+    my $misc_feature = Bio::EnsEMBL::MiscFeature->new(
+      -seqname => $transcript->seq_region_name,
+      -start => $pepgencoord->start,
+      -end   => $pepgencoord->end,
+      -strand => $translateable_exons[0]->strand,
+    );
+    my $attributes = {
+      'so_term' => 'stop_codon',
+      'parent_so_term' => 'transcript',
+      'version' => $transcript->version,
+      'parent' => $transcript->stable_id,
+      'source' => $transcript->source
+    };
+    while (my ($key, $value) = each %{$attributes}) {
+      my $attr = Bio::EnsEMBL::Attribute->new(
+        -CODE => $key,
+        -NAME => $key,
+        -VALUE => $value
+      );
+      $misc_feature->add_Attribute($attr);
+    }
+    push @stop_codon_features, $misc_feature;
+  }
+
+  if ($translateable_exons[0]->strand == 1) {
+    @stop_codon_features = sort {$a->start <=> $b->start } @stop_codon_features;
+  } else {
+    @stop_codon_features = sort {$b->start <=> $a->start } @stop_codon_features;
+  }
+
+  return @stop_codon_features;
+}
+
+sub make_seleno_features {
+  my ($transcript) = @_;
+
+  my @seleno_codon_features;
+
+  my $selenos = check_selenos($transcript);
+  if (exists($selenos->{$transcript->stable_id})) {
+    my ($intrans, $instop) = (0, 0);
+    my $slice_offset = $transcript->slice->start-1;
+    my @translateable_exons = @{$transcript->get_all_translateable_Exons} if $transcript->translation;
+
+    foreach my $exon (@{$transcript->get_all_Exons}) {
+      if ($transcript->translation && $exon == $transcript->translation->start_Exon){
+        $intrans = 1;
+      }
+
+      if ($intrans) {
+        my $cds_exon = shift @translateable_exons;
+        return(()) if (!$cds_exon);
+
+        my $exon_start = $cds_exon->start;
+        my $exon_end = $cds_exon->end;
+
+        if (!$instop){
+          my $cds_start = ($exon_start + $slice_offset);
+          my $cds_end = ($exon_end + $slice_offset);
+
+          foreach my $seleno_mod (split(",", $selenos->{$transcript->stable_id})) {
+            push(@seleno_codon_features, create_seleno_attributes($transcript, $seleno_mod, $cds_start, $cds_end));
+          }
+        }
+      }
+    }
+  }
+
+  return @seleno_codon_features;
+}
+
+sub check_selenos {
+  my ($transcript) = @_;
+
+  my %selenos;
+  my @selenos_attributes = ();
+
+  my $translation = $transcript->translation();
+  if ($translation) {
+    my $attributes = $translation->get_all_Attributes('_selenocysteine');
+
+    foreach my $attr (@{$attributes}) {
+      $attr->value =~ /^(\d+).+/;
+      if ($1) {
+        push(@selenos_attributes, $1);
+      }
+    }
+  }
+
+  if (scalar(@selenos_attributes)) {
+    $selenos{$transcript->stable_id} = join(",", sort {$a<=>$b} @selenos_attributes);
+  }
+
+  return \%selenos;
+}
+
+sub create_seleno_attributes {
+  my ($transcript, $aa_start_pos, $cds_start, $cds_end) = @_;
+
+  my $transcript_mapper = Bio::EnsEMBL::TranscriptMapper->new($transcript);
+  my @coords = $transcript_mapper->pep2genomic($aa_start_pos, $aa_start_pos);
+  my @seleno_codon_features;
+
+  foreach my $coord (@coords) {
+    if ($coord->isa("Bio::EnsEMBL::Mapper::Coordinate")) {
+      if ($coord->start >= $cds_start && $coord->end <= $cds_end) {
+        my $misc_feature = Bio::EnsEMBL::MiscFeature->new(
+          -seqname => $transcript->seq_region_name,
+          -start => $coord->start,
+          -end   => $coord->end,
+          -strand => $transcript->strand,
+        );
+        my $attributes = {
+          'so_term' => 'stop_codon_redefined_as_selenocysteine',
+          'parent_so_term' => 'transcript',
+          'version' => $transcript->version,
+          'parent' => $transcript->stable_id,
+          'source' => $transcript->source
+        };
+        while (my ($key, $value) = each %{$attributes}) {
+          my $attr = Bio::EnsEMBL::Attribute->new(
+            -CODE => $key,
+            -NAME => $key,
+            -VALUE => $value
+          );
+          $misc_feature->add_Attribute($attr);
+        }
+        push @seleno_codon_features, $misc_feature;
+      }
+    }
+  }
+
+  return @seleno_codon_features;
 }
 
 # The serializer will put everything from 'summary_as_hash' into
@@ -315,6 +577,24 @@ sub Bio::EnsEMBL::CDS::summary_as_hash {
   $summary{'Parent'}          = $self->transcript->display_id;
   $summary{'protein_id'}      = $self->translation_id;
   $summary{'version'}         = $self->transcript->translation->version;
+
+  return \%summary;
+}
+
+sub Bio::EnsEMBL::MiscFeature::summary_as_hash {
+  my $self = shift;
+  my %summary;
+
+  $summary{'seq_region_name'} = $self->seqname;
+  $summary{'source'}          = $self->get_scalar_attribute('source');
+  $summary{'start'}           = $self->start;
+  $summary{'end'}             = $self->end;
+  $summary{'strand'}          = $self->strand;
+  $summary{'id'}              = $self->get_scalar_attribute('parent');
+  $summary{'Parent'}          = $self->get_scalar_attribute('parent');
+  $summary{'version'}         = $self->get_scalar_attribute('version');
+  $summary{'so_term'}         = $self->get_scalar_attribute('so_term');
+  $summary{'parent_so_term'}  = $self->get_scalar_attribute('parent_so_term');
 
   return \%summary;
 }
